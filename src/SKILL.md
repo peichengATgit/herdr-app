@@ -26,7 +26,8 @@ only after a successful check; on failure, check the connection and retry.
 Cmd-click on macOS (Ctrl-click elsewhere) a file path in terminal output
 to preview it in the Files panel. A `:line` or `:line:column` suffix selects
 that location. Relative paths use the terminal's working folder, on its machine.
-Remote links are read through that machine's connection, never from a same-named
+Remote paths spanning multiple rows can be clicked on any segment. Remote links are read
+through that machine's connection, never from a same-named
 local path. Layouts without Files use the system opener for local files and
 report that remote links need Files. Web links use the system browser.
 

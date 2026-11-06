@@ -185,7 +185,9 @@ only when expanded. Cmd-click (macOS) or Ctrl-click (other platforms) a
 file path in terminal output to preview it in Files on the terminal's machine.
 `:line` and `:line:column` suffixes move to that source location. Absolute paths may
 point outside the current folder; relative paths use the terminal's folder.
-Remote links are read through the source connection; Files names the machine
+Remote paths can span multiple terminal rows or program-inserted line breaks,
+including early breaks at slashes. Clicking any segment opens the full path. Remote links are read
+through the source connection; Files names the machine
 and reports missing files or connection errors. Remote paths are never checked
 on this computer. Layouts without Files use the system opener for local paths;
 remote file links need a Files panel. Web links use the system browser.

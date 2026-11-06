@@ -558,6 +558,23 @@ fn link_text(rows: &[Row]) -> (String, Vec<Spot>) {
 }
 
 impl Row {
+    /// A program may wrap early at a slash. Continuations keep the same or
+    /// smaller indentation; a more-indented directory listing starts a new item.
+    fn continues_path(&self, next: &Row, cols: u16) -> bool {
+        let left = self.text.trim_end();
+        let right = next.text.trim_start();
+        if left.is_empty() || right.is_empty() { return false; }
+        let last = left.char_indices().last().unwrap().0;
+        let start = word_range(left, last).start;
+        let word = &left[start..];
+        let continuation = right.split_whitespace().next().unwrap();
+        if word.ends_with([')', ']', '}', ',', ';', '.']) { return false; }
+        let path_char = |c: char| c.is_alphanumeric() || "/\\._-~$%:@+#=!?&*;()[]".contains(c);
+        if !continuation.chars().all(path_char) { return false; }
+        self.wraps || self.full(cols)
+            || (word.ends_with(['/', '\\']) && next.text.len() - right.len() <= start)
+    }
+
     /// Whether the row runs on into the next: the terminal wrapped it, or it
     /// reaches the right edge, where a program breaks a line too long to fit.
     fn full(&self, cols: u16) -> bool {
@@ -1048,7 +1065,17 @@ impl Vt {
     /// indentation dropped: programs like Claude Code break long paths onto
     /// new lines themselves. `find` is told when its text holds lines joined; a
     /// link found there wins when it's longer.
-    pub fn link_at(&self, col: u16, row: u16, mut find: impl FnMut(&str, usize, bool) -> Option<std::ops::Range<usize>>) -> Option<LinkHit> {
+    pub fn link_at(&self, col: u16, row: u16, find: impl FnMut(&str, usize, bool) -> Option<std::ops::Range<usize>>) -> Option<LinkHit> {
+        self.link_at_inner(col, row, false, find)
+    }
+
+    /// Remote paths are verified on click, so their continuations can be followed
+    /// syntactically across any number of rows within the text budget.
+    pub fn remote_link_at(&self, col: u16, row: u16, find: impl FnMut(&str, usize, bool) -> Option<std::ops::Range<usize>>) -> Option<LinkHit> {
+        self.link_at_inner(col, row, true, find)
+    }
+
+    fn link_at_inner(&self, col: u16, row: u16, remote: bool, mut find: impl FnMut(&str, usize, bool) -> Option<std::ops::Range<usize>>) -> Option<LinkHit> {
         if col >= self.cols || row >= self.rows {
             return None;
         }
@@ -1062,14 +1089,15 @@ impl Vt {
             p.y
         };
         let hovered = top + row as u32;
-        // A URL longer than this many rows isn't one worth finding.
-        const REACH: u32 = 32;
+        // Bound remote scans by text size while preserving the local URL reach.
+        const PATH_TEXT_BUDGET: usize = 64 * 1024;
+        let reach = if remote { (PATH_TEXT_BUDGET as u32 / u32::from(self.cols).max(1)).max(1) } else { 32 };
         let mut first = hovered;
-        while first > 0 && hovered - first < REACH && self.wraps(first - 1) {
+        while first > 0 && hovered - first < reach && self.wraps(first - 1) {
             first -= 1;
         }
         let mut last = hovered;
-        while last - hovered < REACH && self.wraps(last) && self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, last + 1).is_some() {
+        while last - hovered < reach && self.wraps(last) && self.grid_ref(GHOSTTY_POINT_TAG_SCREEN, 0, last + 1).is_some() {
             last += 1;
         }
         let mut rows: Vec<Row> = (first..=last).map_while(|y| self.link_row(y)).collect();
@@ -1077,6 +1105,59 @@ impl Vt {
         let at = spots.iter().position(|s| s.y == hovered && s.x <= col && col < s.x + s.width)?;
         let hit = self.link_in(&text, &spots, top, at, &mut find, false);
         if spots[at].uri.is_some() {
+            return hit;
+        }
+
+        if remote {
+            let word = word_range(&text, spots[at].byte);
+            let mut budget = PATH_TEXT_BUDGET.saturating_sub(text.len());
+            let mut above = Vec::new();
+            if text[..word.start].trim().is_empty() {
+                let mut y = first;
+                while y > 0 {
+                    y -= 1;
+                    let Some(previous) = self.link_row(y) else { break };
+                    let next = above.last().unwrap_or(&rows[0]);
+                    if previous.text.len() > budget || !previous.continues_path(next, self.cols) { break; }
+                    budget -= previous.text.len();
+                    // A leading bullet or prose belongs only to the path's first row.
+                    let trimmed = previous.text.trim_end();
+                    let start = word_range(trimmed, trimmed.char_indices().last().map_or(0, |(at, _)| at)).start;
+                    let prefix = !trimmed[..start].trim().is_empty();
+                    above.push(previous);
+                    if prefix { break; }
+                }
+            }
+            let mut below = Vec::new();
+            if text[word.end..].trim().is_empty() {
+                let mut y = last;
+                loop {
+                    let Some(next_y) = y.checked_add(1) else { break };
+                    let Some(next) = self.link_row(next_y) else { break };
+                    let previous = below.last().unwrap_or_else(|| rows.last().unwrap());
+                    if next.text.len() > budget || !previous.continues_path(&next, self.cols) { break; }
+                    budget -= next.text.len();
+                    let trimmed = next.text.trim_start();
+                    let end = trimmed.find(char::is_whitespace).unwrap_or(trimmed.len());
+                    let suffix = !trimmed[end..].trim().is_empty();
+                    below.push(next);
+                    y = next_y;
+                    if suffix { break; }
+                }
+            }
+            if !above.is_empty() || !below.is_empty() {
+                rows.splice(0..0, above.into_iter().rev());
+                rows.extend(below);
+                let (joined_text, joined_spots) = link_text(&rows);
+                let joined_at = joined_spots.iter().position(|spot| spot.y == hovered && spot.x <= col && col < spot.x + spot.width)?;
+                if let Some(found) = self.link_in(&joined_text, &joined_spots, top, joined_at, &mut find, true)
+                    && hit.as_ref().is_none_or(|original| found.target.len() > original.target.len())
+                {
+                    return Some(found);
+                }
+                // Restore any target the callback kept before a rejected join.
+                return self.link_in(&text, &spots, top, at, &mut find, false);
+            }
             return hit;
         }
 

@@ -864,19 +864,16 @@ impl TerminalView {
         let (x, y) = local(&g, pos);
         let (col, row) = (x / f32::from(g.cell.width), y / f32::from(g.cell.height));
         let mut target = None;
-        let hit = g.vt.link_at(col as u16, row as u16, |text, at, joined| {
-            let remote = self.address.contains('/');
-            // Soft wraps are already intact. Hard-line joins need a local existence
-            // check to disambiguate them, which must not block on a remote stat.
-            if joined && remote { return None; }
+        let remote = self.address.contains('/');
+        let find = |text: &str, at: usize, joined: bool| {
             // Live terminal addresses take precedence over unverified remote paths.
-            if remote && let Some(range) = links::word(text, at)
+            if remote && !joined && let Some(range) = links::word(text, at)
                 && let Some(address) = crate::mods::terminal_address(&text[range.clone()], &self.address)
             {
                 target = Some(LinkTarget::Terminal(address));
                 return Some(range);
             }
-            let range = if remote { links::find_remote(text, at) } else { links::find(text, at) };
+            let range = if remote { links::find_remote(text, at, joined) } else { links::find(text, at) };
             if let Some(range) = range
                 && let Some(link) = self.resolve_link(&text[range.clone()])
                 && (!joined || matches!(link, links::Target::File { .. }))
@@ -891,7 +888,12 @@ impl TerminalView {
             let address = crate::mods::terminal_address(&text[range.clone()], &self.address)?;
             target = Some(LinkTarget::Terminal(address));
             Some(range)
-        })?;
+        };
+        let hit = if remote {
+            g.vt.remote_link_at(col as u16, row as u16, find)
+        } else {
+            g.vt.link_at(col as u16, row as u16, find)
+        }?;
         // OSC 8 links bypass text detection.
         let target = target.or_else(|| self.resolve_link(&hit.target).map(LinkTarget::External))?;
         Some((target, hit.spans))
@@ -2210,6 +2212,129 @@ mod tests {
             cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
             assert!(!root.read_with(cx, |root, cx| root.text.read(cx).selected_text()).is_empty());
         }
+    }
+
+    #[gpui::test]
+    fn remote_file_links_reconstruct_split_paths_from_either_row(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        let cases = [
+            ("  /nobackup/project/standalone/infra/", "  umts/src/msg_allocator/Makefile:19:3", "/nobackup/project/standalone/infra/umts/src/msg_allocator/Makefile", Some(19), Some(3)),
+            ("See source location (src/transport/", "  shm/Makefile:41).", "/remote/project/src/transport/shm/Makefile", Some(41), None),
+            ("  /remote/project/src/long_file_na", "  me.rs", "/remote/project/src/long_file_name.rs", None, None),
+        ];
+        for (first, second, expected, line, column) in cases {
+            let cols = first.len().max(second.len()) as u16 + 2;
+            let terminal = cx.new(|cx| {
+                let mut terminal = super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (cols, 6), cx);
+                terminal.cwd = Some("/remote/project".into());
+                terminal.grid.borrow_mut().vt.write(format!("{first}\r\n{second}").as_bytes());
+                terminal
+            });
+            for (col, row) in [(first.len() - 3, 0), (second.find(|c: char| !c.is_whitespace()).unwrap() + 2, 1)] {
+                terminal.read_with(cx, |terminal, _| {
+                    let at = {
+                        let grid = terminal.grid.borrow();
+                        grid.origin + gpui::point(grid.cell.width * (col as f32 + 0.5), grid.cell.height * (row as f32 + 0.5))
+                    };
+                    let (target, spans) = terminal.link_at(at).expect("each half resolves to the whole remote path");
+                    assert_eq!(target, super::LinkTarget::External(crate::links::Target::File {
+                        path: expected.into(), line, column,
+                    }), "row {row}: {first} / {second}");
+                    assert_eq!(spans.len(), 2);
+                });
+            }
+        }
+        // The terminal's own soft wraps also resolve from either visible row.
+        let terminal = cx.new(|cx| {
+            let mut terminal = super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (18, 6), cx);
+            terminal.cwd = Some("/remote/project".into());
+            terminal.grid.borrow_mut().vt.write(b"/remote/project/src/deep/source.rs:41");
+            terminal
+        });
+        for row in [0, 1] {
+            terminal.read_with(cx, |terminal, _| {
+                let at = {
+                    let grid = terminal.grid.borrow();
+                    grid.origin + gpui::point(grid.cell.width * 3.5, grid.cell.height * (row as f32 + 0.5))
+                };
+                let (target, spans) = terminal.link_at(at).unwrap();
+                assert_eq!(target, super::LinkTarget::External(crate::links::Target::File {
+                    path: "/remote/project/src/deep/source.rs".into(), line: Some(41), column: None,
+                }));
+                assert!(spans.len() >= 2);
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn remote_file_links_follow_every_segment_of_multiline_paths(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        for count in [3, 4, 6, 12, 40] {
+            for absolute in [true, false] {
+                let prefix = if absolute { "/remote/" } else { "src/" };
+                let mut chunks = vec![prefix.to_owned()];
+                chunks.extend((1..count - 1).map(|i| format!("segment_{i:03}/")));
+                chunks.push("Makefile:1124:7".into());
+                let path = chunks.join("");
+                let expected = if absolute { path.clone() } else { format!("/remote/project/{path}") };
+                let expected = expected.strip_suffix(":1124:7").unwrap();
+                let text = chunks.iter().map(|chunk| format!("  {chunk}")).collect::<Vec<_>>().join("\r\n");
+                let terminal = cx.new(|cx| {
+                    let mut terminal = super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (42, count + 2), cx);
+                    terminal.cwd = Some("/remote/project".into());
+                    terminal.grid.borrow_mut().vt.write(text.as_bytes());
+                    terminal
+                });
+                for row in 0..count {
+                    for col in [2, 3, chunks[row as usize].len() + 1] {
+                        terminal.read_with(cx, |terminal, _| {
+                            let at = {
+                                let grid = terminal.grid.borrow();
+                                grid.origin + gpui::point(grid.cell.width * (col as f32 + 0.5), grid.cell.height * (row as f32 + 0.5))
+                            };
+                            let (target, spans) = terminal.link_at(at).expect("every path segment resolves");
+                            assert_eq!(target, super::LinkTarget::External(crate::links::Target::File {
+                                path: expected.into(), line: Some(1124), column: Some(7),
+                            }), "{count} rows, clicked row {row}, column {col}");
+                            assert_eq!(spans.len(), count as usize);
+                        });
+                    }
+                }
+            }
+        }
+        // More than the former soft-wrap row limit, clicked on every row.
+        let text = format!("/remote/{}/source.rs:91", "longsegment/".repeat(80));
+        let rows = (text.len() + 17) / 18;
+        let terminal = cx.new(|cx| {
+            super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (18, rows as u16 + 2), cx)
+        });
+        terminal.update(cx, |terminal, _| terminal.grid.borrow_mut().vt.write(text.as_bytes()));
+        for row in 0..rows {
+            terminal.read_with(cx, |terminal, _| {
+                let at = {
+                    let grid = terminal.grid.borrow();
+                    grid.origin + gpui::point(grid.cell.width * 0.5, grid.cell.height * (row as f32 + 0.5))
+                };
+                let (target, spans) = terminal.link_at(at).unwrap();
+                assert_eq!(target, super::LinkTarget::External(crate::links::Target::File {
+                    path: text.strip_suffix(":91").unwrap().into(), line: Some(91), column: None,
+                }));
+                assert_eq!(spans.len(), rows);
+            });
+        }
+        // A more-indented directory listing is not a wrapped path.
+        let terminal = cx.new(|cx| {
+            let terminal = super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (42, 6), cx);
+            terminal.grid.borrow_mut().vt.write(b"  src/\r\n    Makefile");
+            terminal
+        });
+        terminal.read_with(cx, |terminal, _| {
+            let at = {
+                let grid = terminal.grid.borrow();
+                grid.origin + gpui::point(grid.cell.width * 4.5, grid.cell.height * 1.5)
+            };
+            assert!(terminal.link_at(at).is_none());
+        });
     }
 
     #[gpui::test]

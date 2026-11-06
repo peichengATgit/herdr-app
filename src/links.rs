@@ -44,14 +44,31 @@ pub fn find(text: &str, at: usize) -> Option<Range<usize>> {
 
 /// Remote paths cannot use a local existence check to recognize names such as
 /// src/Makefile, which Ghostty's conservative dotted relative-path pattern skips.
-pub fn find_remote(text: &str, at: usize) -> Option<Range<usize>> {
+pub fn find_remote(text: &str, at: usize, joined: bool) -> Option<Range<usize>> {
+    // The VT has already removed indentation at a program-inserted line break.
+    // Only join the path-shaped word, keeping neighboring prose out of the match.
+    // Soft wraps and explicit hyperlinks still support filenames with spaces.
+    if joined {
+        if text.get(at..)?.starts_with(char::is_whitespace) { return None; }
+        let start = text[..at].rfind(char::is_whitespace).map_or(0, |offset| {
+            offset + text[offset..].chars().next().unwrap().len_utf8()
+        });
+        let end = text[at..].find(char::is_whitespace).map_or(text.len(), |offset| at + offset);
+        return find_remote(&text[start..end], at - start, false)
+            .map(|range| range.start + start..range.end + start);
+    }
     static RELATIVE: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"(?:[\w.-]+/)+[\w.-]+(?::[0-9]+){0,2}").expect("remote relative file pattern")
     });
-    find(text, at).or_else(|| {
-        RELATIVE.find_iter(text).filter_map(Result::ok)
-            .find(|hit| hit.start() <= at && at < hit.end()).map(|hit| hit.range())
-    })
+    let primary = find(text, at);
+    let relative = RELATIVE.find_iter(text).filter_map(Result::ok)
+        .find(|hit| hit.start() <= at && at < hit.end()).map(|hit| hit.range());
+    match (primary, relative) {
+        // "Makefile:19" contains "file:", but the enclosing relative path is
+        // the target even when the pointer is over the line-number suffix.
+        (Some(a), Some(b)) => Some(if b.len() > a.len() { b } else { a }),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The address-shaped word under the pointer, excluding surrounding punctuation.
@@ -432,8 +449,15 @@ mod tests {
     #[test]
     fn remote_locations_use_the_remote_folder_without_local_existence_checks() {
         let text = "see src/Makefile:19:3 here";
-        let range = find_remote(text, text.find("Makefile").unwrap()).unwrap();
+        let range = find_remote(text, text.find("Makefile").unwrap(), false).unwrap();
         assert_eq!(&text[range], "src/Makefile:19:3");
+        for at in 4..4 + "src/Makefile:19:3".len() {
+            let range = find_remote(text, at, false).unwrap();
+            assert_eq!(&text[range], "src/Makefile:19:3");
+        }
+        let text = "see /remote/source.rs extra/words";
+        let range = find_remote(text, text.find("source").unwrap(), true).unwrap();
+        assert_eq!(&text[range], "/remote/source.rs");
         let expected = Target::File { path: "/remote/project/src/Makefile".into(), line: Some(19), column: Some(3) };
         assert_eq!(resolve_remote("/remote/project/src/Makefile:19:3", None), Some(expected.clone()));
         assert_eq!(resolve_remote("src/Makefile:19:3", Some("/remote/project")), Some(expected.clone()));
