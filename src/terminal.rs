@@ -42,8 +42,8 @@ enum LinkTarget {
 
 pub enum TerminalEvent {
     Peek(String),
-    /// A local file link, opened by the Files mod when present.
-    OpenFile { path: PathBuf, line: Option<usize>, column: Option<usize> },
+    /// A file link on the terminal's source machine.
+    OpenFile { path: PathBuf, line: Option<usize>, column: Option<usize>, machine: Option<String> },
     TitleChanged,
     /// The program ended.
     Ended,
@@ -850,6 +850,14 @@ impl TerminalView {
         self.grid.borrow().hover.is_some()
     }
 
+    fn resolve_link(&self, link: &str) -> Option<links::Target> {
+        if self.address.contains('/') {
+            links::resolve_remote(link, self.cwd.as_deref().and_then(|path| path.to_str()))
+        } else {
+            links::resolve(link, self.cwd.as_deref())
+        }
+    }
+
     /// The link at a window position, and where it shows.
     fn link_at(&self, pos: Point<Pixels>) -> Option<(LinkTarget, vt::Spans)> {
         let g = self.grid.borrow();
@@ -857,9 +865,20 @@ impl TerminalView {
         let (col, row) = (x / f32::from(g.cell.width), y / f32::from(g.cell.height));
         let mut target = None;
         let hit = g.vt.link_at(col as u16, row as u16, |text, at, joined| {
-            // In lines joined back together only a file that exists proves the join right.
-            if let Some(range) = links::find(text, at)
-                && let Some(link) = links::resolve(&text[range.clone()], self.cwd.as_deref())
+            let remote = self.address.contains('/');
+            // Soft wraps are already intact. Hard-line joins need a local existence
+            // check to disambiguate them, which must not block on a remote stat.
+            if joined && remote { return None; }
+            // Live terminal addresses take precedence over unverified remote paths.
+            if remote && let Some(range) = links::word(text, at)
+                && let Some(address) = crate::mods::terminal_address(&text[range.clone()], &self.address)
+            {
+                target = Some(LinkTarget::Terminal(address));
+                return Some(range);
+            }
+            let range = if remote { links::find_remote(text, at) } else { links::find(text, at) };
+            if let Some(range) = range
+                && let Some(link) = self.resolve_link(&text[range.clone()])
                 && (!joined || matches!(link, links::Target::File { .. }))
             {
                 target = Some(LinkTarget::External(link));
@@ -874,7 +893,7 @@ impl TerminalView {
             Some(range)
         })?;
         // OSC 8 links bypass text detection.
-        let target = target.or_else(|| links::resolve(&hit.target, self.cwd.as_deref()).map(LinkTarget::External))?;
+        let target = target.or_else(|| self.resolve_link(&hit.target).map(LinkTarget::External))?;
         Some((target, hit.spans))
     }
 
@@ -1913,8 +1932,9 @@ impl Render for TerminalView {
                 {
                     match target {
                         LinkTarget::External(links::Target::File { path, line, column })
-                            if !this.address.contains('/') && path.is_file() => {
-                            cx.emit(TerminalEvent::OpenFile { path, line, column });
+                            if this.address.contains('/') || path.is_file() => {
+                            let machine = this.address.split_once('/').map(|(machine, _)| machine.to_owned());
+                            cx.emit(TerminalEvent::OpenFile { path, line, column, machine });
                         }
                         LinkTarget::External(target) => links::open(&target),
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
@@ -2190,6 +2210,45 @@ mod tests {
             cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
             assert!(!root.read_with(cx, |root, cx| root.text.read(cx).selected_text()).is_empty());
         }
+    }
+
+    #[gpui::test]
+    fn cmd_click_remote_file_emits_its_machine_and_source_location(cx: &mut gpui::TestAppContext) {
+        use gpui::*;
+        use std::{cell::RefCell, rc::Rc};
+        struct Root { terminal: Entity<super::TerminalView>, _subscription: Subscription }
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div().size_full().child(self.terminal.clone())
+            }
+        }
+        cx.update(gpui_base::init);
+        let opened = Rc::new(RefCell::new(None));
+        let captured = opened.clone();
+        let (root, cx) = cx.add_window_view(|_, cx| {
+            let terminal = cx.new(|cx| {
+                let mut terminal = super::TerminalView::attach(crate::hc::offline(), "remote/t1".into(), (80, 6), cx);
+                terminal.cwd = Some("/remote/project".into());
+                terminal.grid.borrow_mut().vt.write(b"src/Makefile:19:3");
+                terminal
+            });
+            let subscription = cx.subscribe(&terminal, move |_: &mut Root, _, event: &super::TerminalEvent, _| {
+                if let super::TerminalEvent::OpenFile { path, line, column, machine } = event {
+                    *captured.borrow_mut() = Some((path.clone(), *line, *column, machine.clone()));
+                }
+            });
+            Root { terminal, _subscription: subscription }
+        });
+        cx.run_until_parked();
+        let at = root.read_with(cx, |root, cx| {
+            let grid = root.terminal.read(cx).grid.borrow();
+            grid.origin + point(grid.cell.width * 2.5, grid.cell.height * 0.5)
+        });
+        let modifiers = Modifiers { platform: cfg!(target_os = "macos"), control: !cfg!(target_os = "macos"), ..Default::default() };
+        cx.simulate_mouse_move(at, None, modifiers);
+        cx.simulate_mouse_down(at, MouseButton::Left, modifiers);
+        cx.run_until_parked();
+        assert_eq!(*opened.borrow(), Some((std::path::PathBuf::from("/remote/project/src/Makefile"), Some(19), Some(3), Some("remote".into()))));
     }
 
     #[gpui::test]

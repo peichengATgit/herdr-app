@@ -148,7 +148,7 @@ function filesHarness(read: Function = async () => "hello\nworld") {
 test("Files previews absolute local links outside its root and keeps relative remote previews remote", async () => {
   const h = filesHarness();
   h.files.on = "server";
-  h.files.show("/another/project/source.rs", h.cx, { line: 1124 });
+  h.files.show("/another/project/source.rs", h.cx, { line: 1124 }, null);
   await Promise.all(h.pending);
   expect(h.reads[0]).toEqual(["/another/project/source.rs", { on: null }]);
   expect(h.files.position).toEqual({ line: 1124 });
@@ -169,7 +169,7 @@ test("a Files link waits for the hidden panel to open, consumes once, and respec
   h.tree.hidden = false;
   h.files.openRequested(h.cx);
   h.files.openRequested(h.cx);
-  expect(opened).toEqual([[request.path, h.cx, { line: 42, column: 7 }]]);
+  expect(opened).toEqual([[request.path, h.cx, { line: 42, column: 7 }, null]]);
   expect(h.currentRequest()).toBeNull();
   h.request({ ...request, space: "s2" });
   h.files.openRequested(h.cx);
@@ -204,4 +204,48 @@ test("the tab bar reveals Files once for each new link request", async () => {
   request = { id: "two", space: "s1" };
   tabs.openFileRequest({ id: "s1" }, {}, {});
   expect(commands).toHaveLength(4);
+});
+
+test("remote link requests keep their machine for absolute paths and positions", async () => {
+  const h = filesHarness();
+  h.tree.hidden = false;
+  h.request({ id: "remote", space: "s1", machine: "sjc-ads-1046", path: "/nobackup/project/Makefile", line: 19, column: 3 });
+  h.files.openRequested(h.cx);
+  await Promise.all(h.pending);
+  expect(h.reads).toEqual([["/nobackup/project/Makefile", { on: "sjc-ads-1046" }]]);
+  expect(h.files.position).toEqual({ line: 19, column: 3 });
+  expect(h.files.fileMachine).toBe("sjc-ads-1046");
+});
+
+test("identical paths on different machines cannot reuse a stale preview", async () => {
+  const resolvers: ((text: string) => void)[] = [];
+  const h = filesHarness(() => new Promise<string>(resolve => resolvers.push(resolve)));
+  h.files.show("/project/source.rs", h.cx, { line: 1 }, "server-a");
+  h.files.show("/project/source.rs", h.cx, { line: 19 }, "server-b");
+  resolvers[1]("server b"); await h.pending[1];
+  resolvers[0]("server a"); await h.pending[0];
+  expect(h.reads).toEqual([["/project/source.rs", { on: "server-a" }], ["/project/source.rs", { on: "server-b" }]]);
+  expect(h.editors).toHaveLength(1);
+  expect(h.files.code.options.value).toBe("server b");
+  expect(h.files.fileMachine).toBe("server-b");
+});
+
+test("unavailable remote files report their machine and never fall back to local reads", async () => {
+  for (const result of [null, new Error("machine is offline")]) {
+    const h = filesHarness(async () => { if (result instanceof Error) throw result; return result; });
+    h.files.show("/project/Makefile", h.cx, null, "server-a");
+    await Promise.all(h.pending);
+    expect(h.reads).toEqual([["/project/Makefile", { on: "server-a" }]]);
+    expect(h.files.code).toBeNull();
+    expect(h.files.fileError).toContain("server-a");
+    if (result instanceof Error) expect(h.files.fileError).toContain("offline");
+  }
+});
+
+test("absolute paths chosen from a remote Files tree stay on that machine", async () => {
+  const h = filesHarness();
+  h.files.on = "server-a";
+  h.files.show("/project/Makefile", h.cx);
+  await Promise.all(h.pending);
+  expect(h.reads).toEqual([["/project/Makefile", { on: "server-a" }]]);
 });

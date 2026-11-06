@@ -1410,7 +1410,7 @@ impl AppWindow {
             let (block, addr) = (id.clone(), address.clone());
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
-                TerminalEvent::OpenFile { path, line, column } => {
+                TerminalEvent::OpenFile { path, line, column, machine } => {
                     // The core forwards the click; the shipped mods own panel presentation.
                     let has_files = this.chrome.walk().iter().any(|node| {
                         matches!(node.content(), Some(Content::Mod { name, .. }) if name == "files")
@@ -1418,11 +1418,13 @@ impl AppWindow {
                     if has_files {
                         mods::set_shared("files.open".into(), json!({
                             "id": mods::new_overlay_id(), "path": path,
-                            "line": line, "column": column,
+                            "line": line, "column": column, "machine": machine,
                             "space": this.model.active_space().map(|s| &s.id),
                         }));
-                    } else {
+                    } else if machine.is_none() {
                         crate::links::open(&crate::links::Target::File { path: path.clone(), line: *line, column: *column });
+                    } else {
+                        this.command_error("files.open", "This layout needs a Files panel to preview remote files", window, cx);
                     }
                 }
                 TerminalEvent::TitleChanged => this.publish(cx),

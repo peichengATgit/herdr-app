@@ -42,6 +42,18 @@ pub fn find(text: &str, at: usize) -> Option<Range<usize>> {
     None
 }
 
+/// Remote paths cannot use a local existence check to recognize names such as
+/// src/Makefile, which Ghostty's conservative dotted relative-path pattern skips.
+pub fn find_remote(text: &str, at: usize) -> Option<Range<usize>> {
+    static RELATIVE: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?:[\w.-]+/)+[\w.-]+(?::[0-9]+){0,2}").expect("remote relative file pattern")
+    });
+    find(text, at).or_else(|| {
+        RELATIVE.find_iter(text).filter_map(Result::ok)
+            .find(|hit| hit.start() <= at && at < hit.end()).map(|hit| hit.range())
+    })
+}
+
 /// The address-shaped word under the pointer, excluding surrounding punctuation.
 pub fn word(text: &str, at: usize) -> Option<Range<usize>> {
     let allowed = |c: char| c.is_alphanumeric() || matches!(c, '-' | '_' | '/' | '.');
@@ -131,6 +143,56 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
     let line = position.pop();
     let column = position.pop();
     Path::new(bare).exists().then(|| Target::File { path: PathBuf::from(bare), line, column })
+}
+
+/// Resolve a path on the source machine without touching the host filesystem.
+/// Existence and read access are checked asynchronously by the Files mod on click.
+pub fn resolve_remote(link: &str, cwd: Option<&str>) -> Option<Target> {
+    let decoded;
+    let link = if link.starts_with("file:") {
+        let uri = url::Url::parse(link).ok()?;
+        decoded = percent_encoding::percent_decode_str(uri.path()).decode_utf8().ok()?.into_owned();
+        // A Windows file URI uses /C:/..., regardless of this computer's OS.
+        if decoded.as_bytes().get(2) == Some(&b':') { &decoded[1..] } else { &decoded }
+    } else {
+        link
+    };
+    let drive = |path: &str| path.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+        && path.as_bytes().get(1) == Some(&b':')
+        && matches!(path.as_bytes().get(2), Some(b'/') | Some(b'\\'));
+    if !drive(link) && link.split_once(':').is_some_and(|(scheme, _)| {
+        scheme.len() > 1 && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+            && scheme.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    }) {
+        return Some(Target::Url(link.into()));
+    }
+    if link.is_empty() || link.chars().any(char::is_control) || link.starts_with('~') {
+        return None;
+    }
+    let mut path = link.strip_suffix('.').unwrap_or(link);
+    let mut position = Vec::new();
+    for _ in 0..2 {
+        match path.rsplit_once(':') {
+            Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                position.push(n.parse::<usize>().ok()?.max(1));
+                path = head;
+            }
+            _ => break,
+        }
+    }
+    let line = position.pop();
+    let column = position.pop();
+    // $PWD is known from this terminal; other variables belong to the remote shell.
+    let path = if let Some(relative) = path.strip_prefix("$PWD/") {
+        format!("{}/{}", cwd?.trim_end_matches(['/', '\\']), relative)
+    } else if path.starts_with('$') {
+        return None;
+    } else if path.starts_with('/') || path.starts_with("\\\\") || drive(path) {
+        path.to_owned()
+    } else {
+        format!("{}/{}", cwd?.trim_end_matches(['/', '\\']), path)
+    };
+    Some(Target::File { path: PathBuf::from(path), line, column })
 }
 
 /// Hands the target to the system's default handler.
@@ -365,6 +427,34 @@ mod tests {
         assert_eq!(&text[range.clone()], "build.box/t1");
         assert_eq!(terminal_address(&text[range.clone()], "t2", ["box/t1"]), None);
         assert_eq!(terminal_address(&text[range], "t2", ["box/t1", "build.box/t1"]), Some("build.box/t1".into()));
+    }
+
+    #[test]
+    fn remote_locations_use_the_remote_folder_without_local_existence_checks() {
+        let text = "see src/Makefile:19:3 here";
+        let range = find_remote(text, text.find("Makefile").unwrap()).unwrap();
+        assert_eq!(&text[range], "src/Makefile:19:3");
+        let expected = Target::File { path: "/remote/project/src/Makefile".into(), line: Some(19), column: Some(3) };
+        assert_eq!(resolve_remote("/remote/project/src/Makefile:19:3", None), Some(expected.clone()));
+        assert_eq!(resolve_remote("src/Makefile:19:3", Some("/remote/project")), Some(expected.clone()));
+        assert_eq!(resolve_remote("$PWD/src/Makefile:19:3", Some("/remote/project/")), Some(expected));
+        assert_eq!(resolve_remote("src/Makefile:19", None), None);
+        assert_eq!(resolve_remote("$HOME/private.txt", Some("/remote/project")), None);
+        assert_eq!(resolve_remote("~/private.txt", Some("/remote/project")), None);
+        assert_eq!(resolve_remote("/missing/on/this/computer.rs", None), Some(Target::file("/missing/on/this/computer.rs".into())));
+        assert_eq!(resolve_remote("/remote/file\0.rs", None), None);
+    }
+
+    #[test]
+    fn remote_file_uris_decode_paths_and_preserve_source_locations() {
+        assert_eq!(resolve_remote("file://server/remote/%E4%BD%A0%E5%A5%BD%20file.rs:42:7", None),
+            Some(Target::File { path: "/remote/你好 file.rs".into(), line: Some(42), column: Some(7) }));
+        assert_eq!(resolve_remote("file:///C:/work/source.rs:8", None),
+            Some(Target::File { path: "C:/work/source.rs".into(), line: Some(8), column: None }));
+        assert_eq!(resolve_remote("C:/work/source.rs:8", None),
+            Some(Target::File { path: "C:/work/source.rs".into(), line: Some(8), column: None }));
+        assert_eq!(resolve_remote("https://example.com/?a=1&b=2", Some("/remote")),
+            Some(Target::Url("https://example.com/?a=1&b=2".into())));
     }
 
     #[test]
