@@ -7034,6 +7034,7 @@ globalThis.__gpui = (() => {
           __handle: handle,
           value: () => __editor_value(handle),
           set_value: (value) => __editor_set_value(handle, String(value)),
+          reveal_line: (line, column = 1) => __editor_reveal_line(handle, line, column),
           on: (event, handler) => __editor_on(handle, String(event), handler),
           release: () => __editor_release(handle),
         };

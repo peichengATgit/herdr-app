@@ -127,3 +127,81 @@ test("Files follows directory links one level at a time", async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+function filesHarness(read: Function = async () => "hello\nworld") {
+  const pending: Promise<unknown>[] = [], reads: unknown[] = [], editors: any[] = [];
+  let request: any = null;
+  const tree = { id: "panel", type: "column", hidden: true, children: [{ type: "block", content: { mod: "files" } }] };
+  const Files = new Function("View", "readTextFile", "EditorState", "theme", "settings", "LANG", "shared", "setShared", "layout", "location", "filesVisible",
+    source.slice(source.indexOf("export default class")).replace("export default ", "") + "; return Files;")(
+    class {}, async (...args: unknown[]) => { reads.push(args); return read(...args); },
+    { new: (options: any) => { const editor = { options, release() {} }; editors.push(editor); return editor; } },
+    () => ({}), () => ({ font_family: "mono" }), {}, () => request, (_key: string, value: any) => { request = value; }, () => tree,
+    () => ({ space: "s1" }), new Function(source.slice(source.indexOf("function filesVisible("), source.indexOf("const key =")) + "; return filesVisible;")(),
+  );
+  const files = new Files();
+  files.context = {}; files.root = "/project"; files.on = null; files.current = () => true;
+  const cx = { spawn: (f: Function) => pending.push(f(cx)), notify() {} };
+  return { files, cx, reads, editors, tree, pending, request: (value: any) => { request = value; }, currentRequest: () => request };
+}
+
+test("Files previews absolute local links outside its root and keeps relative remote previews remote", async () => {
+  const h = filesHarness();
+  h.files.on = "server";
+  h.files.show("/another/project/source.rs", h.cx, { line: 1124 });
+  await Promise.all(h.pending);
+  expect(h.reads[0]).toEqual(["/another/project/source.rs", { on: null }]);
+  expect(h.files.position).toEqual({ line: 1124 });
+  h.files.show("src/main.rs", h.cx);
+  await Promise.all(h.pending);
+  expect(h.reads[1]).toEqual(["/project/src/main.rs", { on: "server" }]);
+});
+
+test("a Files link waits for the hidden panel to open, consumes once, and respects its space", () => {
+  const h = filesHarness();
+  const opened: unknown[] = [];
+  h.files.show = (...args: unknown[]) => opened.push(args);
+  const request = { id: "one", path: "/project/main.rs", line: 42, column: 7, space: "s1" };
+  h.request(request);
+  h.files.openRequested(h.cx);
+  expect(opened).toHaveLength(0);
+  expect(h.currentRequest()).toBe(request);
+  h.tree.hidden = false;
+  h.files.openRequested(h.cx);
+  h.files.openRequested(h.cx);
+  expect(opened).toEqual([[request.path, h.cx, { line: 42, column: 7 }]]);
+  expect(h.currentRequest()).toBeNull();
+  h.request({ ...request, space: "s2" });
+  h.files.openRequested(h.cx);
+  expect(opened).toHaveLength(1);
+});
+
+test("a newer click on the same file wins when preview reads finish out of order", async () => {
+  const resolvers: ((value: string) => void)[] = [];
+  const h = filesHarness(() => new Promise<string>(resolve => resolvers.push(resolve)));
+  h.files.show("main.rs", h.cx, { line: 1 });
+  h.files.show("main.rs", h.cx, { line: 42 });
+  resolvers[1]("new"); await h.pending[1];
+  resolvers[0]("old"); await h.pending[0];
+  expect(h.editors).toHaveLength(1);
+  expect(h.files.code.options.value).toBe("new");
+  expect(h.files.position.line).toBe(42);
+});
+
+test("the tab bar reveals Files once for each new link request", async () => {
+  const tabsSource = await readFile(new URL("../defaults/mods/tabs/main.js", import.meta.url), "utf8");
+  let request: any = { id: "one", space: "s1" };
+  const commands: unknown[] = [];
+  const Tabs = new Function("View", "shared", "run", tabsSource.slice(tabsSource.indexOf("export default class")).replace("export default ", "") + ";return Tabs;")(
+    class {}, () => request, (...args: unknown[]) => commands.push(args),
+  );
+  const tabs = new Tabs();
+  tabs.openFileRequest({ id: "s2" }, {}, {});
+  expect(commands).toHaveLength(0);
+  tabs.openFileRequest({ id: "s1" }, {}, {});
+  tabs.openFileRequest({ id: "s1" }, {}, {});
+  expect(commands).toEqual([["layout.select", { stack: "panel-body", child: "files" }], ["layout.show", { id: "panel" }]]);
+  request = { id: "two", space: "s1" };
+  tabs.openFileRequest({ id: "s1" }, {}, {});
+  expect(commands).toHaveLength(4);
+});

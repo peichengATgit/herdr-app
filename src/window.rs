@@ -1410,6 +1410,21 @@ impl AppWindow {
             let (block, addr) = (id.clone(), address.clone());
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
+                TerminalEvent::OpenFile { path, line, column } => {
+                    // The core forwards the click; the shipped mods own panel presentation.
+                    let has_files = this.chrome.walk().iter().any(|node| {
+                        matches!(node.content(), Some(Content::Mod { name, .. }) if name == "files")
+                    });
+                    if has_files {
+                        mods::set_shared("files.open".into(), json!({
+                            "id": mods::new_overlay_id(), "path": path,
+                            "line": line, "column": column,
+                            "space": this.model.active_space().map(|s| &s.id),
+                        }));
+                    } else {
+                        crate::links::open(&crate::links::Target::File { path: path.clone(), line: *line, column: *column });
+                    }
+                }
                 TerminalEvent::TitleChanged => this.publish(cx),
                 TerminalEvent::Ended => this.terminal_ended(&block, window, cx),
                 TerminalEvent::ContextMenu(at) => {

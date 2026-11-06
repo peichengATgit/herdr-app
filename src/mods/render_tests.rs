@@ -825,3 +825,50 @@ fn status_bar_shows_the_real_palette_key(cx: &mut TestAppContext) {
     assert!(tree.contains("commands"), "unbound hint still offers commands: {tree}");
     assert!(!tree.contains("Shift P"), "unbound hint must not invent a key: {tree}");
 }
+
+#[gpui::test]
+fn file_link_location_reveals_the_native_editor_after_layout(cx: &mut TestAppContext) {
+    use gpui::IntoElement as _;
+    use gpui_base::input::EditorState;
+    cx.update(gpui_shell::init);
+    let captured = Rc::new(RefCell::new(None));
+    let capture = captured.clone();
+    let _observe = cx.update(|cx| cx.observe_new::<EditorState>(move |_, _, cx| {
+        *capture.borrow_mut() = Some(cx.entity());
+    }));
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let staged = Staged::new();
+    let source = r#"
+import { View } from "gpui-kit";
+import { v_flex, Editor, EditorState } from "gpui-base";
+export default class Preview extends View {
+  init() {
+    this.code = EditorState.new({readonly: true, value: Array.from({length: 1200}, (_, i) => `line${i + 1}`).join("\n")});
+    this.revealed = false;
+  }
+  render() {
+    return v_flex().id("preview").h(120).w(400).on_size_change(() => {
+      if (!this.revealed) { this.revealed = true; this.code.reveal_line(1124, 2); }
+    }).child(Editor.new(this.code).flex_1().min_h(0));
+  }
+}
+"#;
+    std::fs::write(staged.0.join("main.js"), source).unwrap();
+    let context = cx.add_empty_window();
+    let root = context.update(|window, cx| runtime.try_load(&staged.0, window, cx)).unwrap();
+    let view = context.update(|_, cx| root.read(cx).content().clone());
+    for _ in 0..3 {
+        let view = view.clone();
+        context.draw(gpui::Point::default(), gpui::size(gpui::px(400.), gpui::px(120.)), move |_, _| view.into_any_element());
+        context.run_until_parked();
+    }
+    let editor = captured.borrow().clone().expect("native editor created");
+    context.update(|_, cx| {
+        let state = editor.read(cx);
+        let text = state.value();
+        let expected = text.find("line1124").unwrap() + 1;
+        assert_eq!(state.selected_range(), expected..expected);
+        assert!(state.scroll_offset().y < gpui::px(0.), "file link should scroll past the first page");
+        assert!(!state.is_editable());
+    });
+}

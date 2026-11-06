@@ -497,6 +497,22 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
         ),
     )?;
 
+    let reveal_editor = runtime.clone();
+    globals.set(
+        "__editor_reveal_line",
+        Func::from(move |ctx: Ctx<'_>, handle: EntityHandle, line: usize, column: usize| -> JsResult<()> {
+            refuse_mutation_in_render(&ctx, "EditorState.reveal_line(...)")?;
+            let editor = live_editor(&ctx, &reveal_editor, handle)?;
+            scope::with_current_app(|cx| {
+                editor.update(cx, |state, cx| {
+                    let text = state.value();
+                    let offset = crate::entities::editor_position(&text, line, column);
+                    state.set_selected_range(offset..offset, cx);
+                });
+            }).ok_or_else(|| needs_call(&ctx, "EditorState.reveal_line(...)"))
+        }),
+    )?;
+
     let subscribe_editor = runtime.clone();
     globals.set(
         "__editor_on",

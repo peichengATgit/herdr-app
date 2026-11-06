@@ -202,6 +202,34 @@ impl Default for EditorOptions {
     }
 }
 
+/// Convert a one-based source location to a UTF-8 offset, clamped to the file.
+pub(crate) fn editor_position(text: &str, line: usize, column: usize) -> usize {
+    let mut start = 0;
+    for _ in 1..line.max(1) {
+        let Some(end) = text[start..].find('\n') else { return text.len() };
+        start += end + 1;
+    }
+    let row = text[start..].split(['\r', '\n']).next().unwrap_or("");
+    start + row.char_indices().nth(column.saturating_sub(1)).map_or(row.len(), |(offset, _)| offset)
+}
+
+#[cfg(test)]
+mod editor_position_tests {
+    use super::editor_position;
+
+    #[test]
+    fn source_positions_clamp_and_respect_unicode_and_crlf() {
+        let text = "first\r\n你好!\nlast";
+        assert_eq!(editor_position(text, 2, 1), 7);
+        assert_eq!(editor_position(text, 2, 2), 10);
+        assert_eq!(editor_position(text, 2, 99), 14);
+        assert_eq!(editor_position(text, 0, 0), 0);
+        assert_eq!(editor_position(text, usize::MAX, 1), text.len());
+        assert_eq!(editor_position("", 1, 1), 0);
+        assert_eq!(editor_position("line\n", 2, 1), 5);
+    }
+}
+
 type OtpHandler = dyn Fn(&OtpEvent, &mut Window, &mut App);
 
 /// One native subscription per event name. Re-registering replaces only the

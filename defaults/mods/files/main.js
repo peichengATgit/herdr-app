@@ -1,13 +1,19 @@
 // A lazy file browser for the focused pane's folder, with bounded read-only previews.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, Editor, EditorState } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, window, shared, setShared, layout } from "herdr";
 
 function location() {
   const space = spaces().find(s => s.active), f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
+}
+function filesVisible(node) {
+  if (!node || node.hidden) return false;
+  if (node.content?.mod === "files") return true;
+  const children = node.children ?? [];
+  return children.some(child => (node.type !== "stack" || !node.active || child.id === node.active) && filesVisible(child));
 }
 const key = () => JSON.stringify(location());
 const LANG = { ts: "js", tsx: "js", mts: "js", cts: "js", jsx: "js", mjs: "js", toml: "yaml", jsonc: "json", svelte: "html", vue: "html" };
@@ -72,12 +78,12 @@ export default class Files extends View {
   refresh(cx) {
     const { cwd, on } = location(), next = key();
     if (next !== this.context?.key) {
-      if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
+      if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file, position: this.position });
       const saved = this.saved.get(next);
       this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
-      if (saved?.file) this.show(saved.file, cx);
+      if (saved?.file) this.show(saved.file, cx, saved.position);
     }
     if (!cwd || this.loading) return;
     const context = this.context;
@@ -127,14 +133,16 @@ export default class Files extends View {
     cx.notify();
   }
 
-  show(path, cx) {
-    this.code?.release(); this.code = null; this.file = path; this.fileError = null;
+  show(path, cx, position = null) {
+    this.code?.release(); this.code = null; this.file = path; this.fileError = null; this.position = position; this.revealed = false; this.previewId = (this.previewId ?? 0) + 1;
+    const request = this.fileRequest = {};
     if (!path || !cx) return;
     const context = this.context, root = this.root, on = this.on;
     cx.spawn(async cx => {
       try {
-        const text = await readTextFile(`${root}/${path}`, { on });
-        if (this.file !== path || !this.current(context)) return;
+        const absolute = /^(?:[A-Za-z]:[\\/]|[\\/])/.test(path);
+        const text = await readTextFile(absolute ? path : `${root}/${path}`, { on: absolute ? null : on });
+        if (this.fileRequest !== request || !this.current(context)) return;
         if (text === null) { this.fileError = "This file is no longer available"; return; }
         if (text.includes("\0")) { this.fileError = "Binary file · no text preview"; return; }
         const t = theme(), ext = path.includes(".") ? path.split(".").pop() : "txt";
@@ -142,7 +150,7 @@ export default class Files extends View {
           value: text.length > 400000 ? text.slice(0, 400000) + "\n… (file truncated)" : text,
           font_family: settings().font_family, font_size: 12,
           syntax: { keyword: t.ansi5, string: t.ansi2, comment: t.dim, function: t.ansi4, type: t.ansi3, number: t.ansi1, constant: t.ansi6 } });
-      } catch { if (this.file === path && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
+      } catch { if (this.fileRequest === request && this.current(context)) this.fileError = "Cannot preview this file (binary, too large, or unreadable)"; }
       finally { cx.notify(); }
     });
   }
@@ -163,8 +171,18 @@ export default class Files extends View {
     return out;
   }
 
+  openRequested(cx) {
+    const request = shared("files.open");
+    if (request && request.space === location().space && filesVisible(layout())) {
+      setShared("files.open", null);
+      this.show(request.path, cx, { line: request.line, column: request.column });
+    }
+  }
+
   render(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
+    this.openRequested(cx);
+    const code = this.code, position = this.position;
     const t = theme();
     return v_flex().id("files").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13)
       .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
@@ -174,6 +192,12 @@ export default class Files extends View {
       .when(!this.file, el => el.child(v_flex().id("files-tree").flex_1().min_h(0).overflow_y_scrollbar().p(6).children(this.rows("", 0, [], t))
         .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? "Loading files…" : this.root ? "No files" : "No folder"))))
         .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child("File list limited to 500 entries per folder and 5,000 total")))))
-      .when(Boolean(this.file), el => el.child(this.code ? Editor.new(this.code).flex_1().min_h(0) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
+      .when(Boolean(this.file), el => el.child(this.code ? v_flex().id(`file-preview-${this.previewId}`).flex_1().min_h(0).on_size_change((_size, cx) => {
+        if (!this.revealed && code && this.code === code && position?.line) {
+          this.revealed = true;
+          code.reveal_line(position.line, position.column ?? 1);
+          cx.notify();
+        }
+      }).child(Editor.new(this.code).flex_1().min_h(0)) : div().p(12).text_color(t.dim).child(this.fileError || "Loading file…")));
   }
 }

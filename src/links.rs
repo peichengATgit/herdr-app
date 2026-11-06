@@ -69,12 +69,27 @@ pub fn terminal_address<'a>(word: &str, source: &str, live: impl IntoIterator<It
 #[derive(Clone, Debug, PartialEq)]
 pub enum Target {
     Url(String),
-    File(PathBuf),
+    File { path: PathBuf, line: Option<usize>, column: Option<usize> },
+}
+
+impl Target {
+    fn file(path: PathBuf) -> Self {
+        Self::File { path, line: None, column: None }
+    }
 }
 
 /// What a link opens. File paths count only when they exist here; relative
 /// ones need the terminal's folder.
 pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
+    if link.starts_with("file:") {
+        if let Ok(url) = url::Url::parse(link)
+            && let Ok(path) = url.to_file_path()
+            && let Some(target) = path.to_str().and_then(|path| resolve(path, cwd))
+        {
+            return Some(target);
+        }
+        return Some(Target::Url(link.to_owned()));
+    }
     let scheme = link.split_once(':').is_some_and(|(s, _)| {
         s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
     });
@@ -98,24 +113,31 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
     let full = if expanded.is_absolute() { expanded } else { cwd?.join(expanded) };
     // Windows ignores a trailing period when checking whether a path exists.
     if !(cfg!(windows) && full.extension().is_some_and(|ext| ext.is_empty())) && full.exists() {
-        return Some(Target::File(full));
+        return Some(Target::file(full));
     }
     // The period ending a sentence, or `:42` / `:42:7` naming a place in the file.
     let mut bare = full.to_str()?.strip_suffix('.').unwrap_or(full.to_str()?);
+    let mut position = Vec::new();
     for _ in 0..2 {
         match bare.rsplit_once(':') {
-            Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => bare = head,
+            Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+                let Ok(n) = n.parse::<usize>() else { return None };
+                position.push(n.max(1));
+                bare = head;
+            }
             _ => break,
         }
     }
-    Path::new(bare).exists().then(|| Target::File(PathBuf::from(bare)))
+    let line = position.pop();
+    let column = position.pop();
+    Path::new(bare).exists().then(|| Target::File { path: PathBuf::from(bare), line, column })
 }
 
 /// Hands the target to the system's default handler.
 pub fn open(target: &Target) {
     let arg = match target {
         Target::Url(u) => std::ffi::OsStr::new(u),
-        Target::File(p) => p.as_os_str(),
+        Target::File { path, .. } => path.as_os_str(),
     };
     open_system(arg);
 }
@@ -275,7 +297,7 @@ mod tests {
 
     #[test]
     fn query_links_keep_their_full_target() {
-        for url in ["https://example.com/?a=1&b=2", "https://localhost:17480/login?t=abc%3D%3D", "file:///C:/Windows/System32/winver.exe"] {
+        for url in ["https://example.com/?a=1&b=2", "https://localhost:17480/login?t=abc%3D%3D"] {
             let text = format!("Dashboard: {url}");
             let range = find(&text, text.find(url).unwrap()).unwrap();
             assert_eq!(&text[range.clone()], url);
@@ -350,14 +372,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("herdr-links-{}", std::process::id()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join("src/main.rs"), "").unwrap();
-        let file = Target::File(dir.join("src/main.rs"));
+        let file = Target::file(dir.join("src/main.rs"));
         assert_eq!(resolve("src/main.rs", Some(&dir)), Some(file.clone()));
-        assert_eq!(resolve("src/main.rs:42:7", Some(&dir)), Some(file.clone()));
+        assert_eq!(resolve("src/main.rs:42:7", Some(&dir)), Some(Target::File { path: dir.join("src/main.rs"), line: Some(42), column: Some(7) }));
+        assert_eq!(resolve("src/main.rs:1124", Some(&dir)), Some(Target::File { path: dir.join("src/main.rs"), line: Some(1124), column: None }));
         assert_eq!(resolve("src/main.rs.", Some(&dir)), Some(file.clone()));
-        assert_eq!(resolve("src/.", Some(&dir)), Some(Target::File(dir.join("src/."))));
-        assert_eq!(resolve("src/..", Some(&dir)), Some(Target::File(dir.join("src/.."))));
+        assert_eq!(resolve("src/.", Some(&dir)), Some(Target::file(dir.join("src/."))));
+        assert_eq!(resolve("src/..", Some(&dir)), Some(Target::file(dir.join("src/.."))));
         assert_eq!(resolve("$PWD/src/main.rs", Some(&dir)), Some(file.clone()));
         assert_eq!(resolve(dir.join("src/main.rs").to_str().unwrap(), None), Some(file));
+        let uri = url::Url::from_file_path(dir.join("src/main.rs")).unwrap();
+        assert_eq!(resolve(uri.as_str(), None), Some(Target::file(dir.join("src/main.rs"))));
+        assert_eq!(resolve(&format!("{uri}:42:7"), None), Some(Target::File { path: dir.join("src/main.rs"), line: Some(42), column: Some(7) }));
+        #[cfg(unix)]
+        {
+            let spaced = dir.join("src/文件 name.rs");
+            std::fs::write(&spaced, "").unwrap();
+            let uri = url::Url::from_file_path(&spaced).unwrap();
+            assert_eq!(resolve(uri.as_str(), None), Some(Target::file(spaced)));
+        }
         assert_eq!(resolve("src/gone.rs", Some(&dir)), None);
         assert_eq!(resolve("src/main.rs", None), None);
         assert_eq!(resolve("https://a.com/x", None), Some(Target::Url("https://a.com/x".into())));
@@ -365,7 +398,7 @@ mod tests {
         {
             let dotted = dir.join("src/main.rs.");
             std::fs::write(&dotted, "").unwrap();
-            assert_eq!(resolve("src/main.rs.", Some(&dir)), Some(Target::File(dotted)));
+            assert_eq!(resolve("src/main.rs.", Some(&dir)), Some(Target::file(dotted)));
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

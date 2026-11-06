@@ -23,6 +23,11 @@ its terminals.
 `app.check_updates` checks for newer releases. Settings reports "Up to date"
 only after a successful check; on failure, check the connection and retry.
 
+Cmd-click on macOS (Ctrl-click elsewhere) a local file path in terminal output
+to preview it in the Files panel. A `:line` or `:line:column` suffix selects
+that location. Relative paths use the terminal's working folder. Layouts
+without Files use the system file opener; web links use the system browser.
+
 ## Show something when asked
 
 New spaces and tabs are shown immediately: only create them when asked.

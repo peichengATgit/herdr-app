@@ -45,6 +45,16 @@ export default class Tabs extends View {
     localStorage.setItem("panels", JSON.stringify(this.panels));
   }
 
+  openFileRequest(space, panel, body) {
+    const fileRequest = shared("files.open");
+    if (fileRequest && fileRequest.space === space?.id && fileRequest.id !== this.fileRequest && panel && body) {
+      this.fileRequest = fileRequest.id;
+      this.pending = { want: "files", until: Date.now() + 1000 };
+      run("layout.select", { stack: "panel-body", child: "files" });
+      run("layout.show", { id: "panel" });
+    }
+  }
+
   render() {
     const t = theme();
     const space = spaces().find(p => p.active);
@@ -79,6 +89,7 @@ export default class Tabs extends View {
     const panel = find(root, "panel"), body = find(root, "panel-body");
     const enabled = shared("workspace.panels") ?? ["files", "changes"];
     this.syncPanel(space, panel, body, enabled);
+    this.openFileRequest(space, panel, body);
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)

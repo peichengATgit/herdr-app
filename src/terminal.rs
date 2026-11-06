@@ -42,6 +42,8 @@ enum LinkTarget {
 
 pub enum TerminalEvent {
     Peek(String),
+    /// A local file link, opened by the Files mod when present.
+    OpenFile { path: PathBuf, line: Option<usize>, column: Option<usize> },
     TitleChanged,
     /// The program ended.
     Ended,
@@ -858,7 +860,7 @@ impl TerminalView {
             // In lines joined back together only a file that exists proves the join right.
             if let Some(range) = links::find(text, at)
                 && let Some(link) = links::resolve(&text[range.clone()], self.cwd.as_deref())
-                && (!joined || matches!(link, links::Target::File(_)))
+                && (!joined || matches!(link, links::Target::File { .. }))
             {
                 target = Some(LinkTarget::External(link));
                 return Some(range);
@@ -1910,6 +1912,10 @@ impl Render for TerminalView {
                     && let Some((target, _)) = this.link_at(ev.position)
                 {
                     match target {
+                        LinkTarget::External(links::Target::File { path, line, column })
+                            if !this.address.contains('/') && path.is_file() => {
+                            cx.emit(TerminalEvent::OpenFile { path, line, column });
+                        }
                         LinkTarget::External(target) => links::open(&target),
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
                     }

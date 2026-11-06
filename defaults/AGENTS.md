@@ -181,7 +181,12 @@ the title bar, panes as cards, a space picker) and `win98`
 writing a new file. The Files panel supports Windows folder paths with spaces,
 parentheses and apostrophes, and preserves Unicode file and folder names
 (including Chinese). Directory links expand as folders; their contents load
-only when expanded.
+only when expanded. Cmd-click (macOS) or Ctrl-click (other platforms) an
+existing local file path in terminal output to preview it in Files. `:line`
+and `:line:column` suffixes move to that source location. Absolute paths may
+point outside the current folder; relative paths use the terminal's folder.
+Layouts without the Files mod use the system file opener. Web links use the
+system browser.
 
 **Herdr's own layouts and mods are read-only.** They are replaced whole
 on every start. Use settings.json for look (fonts, sizes, theme, colors,

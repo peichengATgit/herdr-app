@@ -3143,6 +3143,8 @@ const BASE: &str = r#"  /** A row. */
   // HERDR: built-in source editing and read-only code viewing.
   export interface EditorState {
     value(): string;
+    /** Select and reveal a one-based line/column after layout; clamps to the file. */
+    reveal_line(line: number, column?: number): void;
     /** Programmatic replacement works even in readonly mode. */
     set_value(value: string): void;
     on(event: "change" | "submit" | "focus" | "blur" | "paste_other", handler: (event: InputEvent, cx: Context) => void): boolean;
