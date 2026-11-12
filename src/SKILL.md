@@ -31,6 +31,11 @@ through that machine's connection, never from a same-named
 local path. Layouts without Files use the system opener for local files and
 report that remote links need Files. Web links use the system browser.
 
+The Changes panel defaults to the whole repository. "Use current pane directory"
+pins it to that folder and descendants, saved per space even when panes or working
+folders change. "Whole repository" clears the pin. Directory scope disables Commit;
+whole-repository Commit stages all repository changes.
+
 ## Show something when asked
 
 New spaces and tabs are shown immediately: only create them when asked.

@@ -1,12 +1,16 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings } from "herdr";
+import { spaces, panes, focused, exec, readTextFile, watchFolder, theme, settings, shared, setShared } from "herdr";
 
-function location() {
+function paneLocation() {
   const space = spaces().find((s) => s.active), f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
   const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
-  return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+  return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space ? JSON.stringify([space.machine ?? null, space.id]) : null };
+}
+function location() {
+  const live = paneLocation(), scope = live.space ? shared("changes.scopes")?.[live.space] : null;
+  return { ...live, ...(scope ? { cwd: scope.cwd, on: scope.on } : {}), scoped: Boolean(scope) };
 }
 const key = () => JSON.stringify(location());
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):
@@ -44,6 +48,17 @@ export default class Changes extends View {
     cx.timer.every(10000, (cx) => this.refresh(cx));
   }
 
+  setScope(pinned, cx) {
+    if (this.busy) return;
+    const live = paneLocation();
+    if (!live.space || (pinned && !live.cwd)) return;
+    const scopes = { ...(shared("changes.scopes") ?? {}) };
+    if (pinned) scopes[live.space] = { cwd: live.cwd, on: live.on };
+    else delete scopes[live.space];
+    setShared("changes.scopes", scopes);
+    this.refresh(cx); cx.notify();
+  }
+
   watch(root, cx) {
     if (this.on || this.watched === root) return;
     this.watched = root;
@@ -59,7 +74,7 @@ export default class Changes extends View {
 
   refresh(cx) {
     if (this.loading || this.busy) return;
-    const { cwd, on } = location(), context = key();
+    const { cwd, on, scoped } = location(), context = key();
     if (context !== this.context) {
       this.context = context; this.root = null; this.files = []; this.open = null;
       this.setLines([]); this.message = ""; this.input.set_value(""); this.error = null; this.note = null; this.watched = null; this.closed = false; this.limited = false;
@@ -72,11 +87,21 @@ export default class Changes extends View {
         if (key() !== context) return;
         if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
+        // Keep porcelain paths repository-relative for previews, but ask Git to
+        // traverse only the pinned subtree. Literal pathspecs preserve names
+        // containing spaces, brackets, or other Git pathspec characters.
+        let prefix = "";
+        if (scoped) {
+          const result = await exec("git", ["rev-parse", "--show-prefix"], { cwd, on });
+          if (result.code !== 0) throw new Error(result.stderr);
+          prefix = result.stdout.replace(/\r?\n$/, "");
+        }
+        const paths = scoped ? ["--", prefix ? `:(top,literal)${prefix}` : "."] : [];
+        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all", ...paths]);
         if (status.code !== 0) throw new Error(status.stderr);
         const head = await git(["rev-parse", "--verify", "HEAD"]);
         const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames", ...paths])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames", ...paths]), await git(["diff", "--numstat", "-z", "--no-renames", ...paths])];
         for (const result of results) {
           if (result.code !== 0) throw new Error(result.stderr);
           for (const entry of result.stdout.split("\0")) {
@@ -97,7 +122,7 @@ export default class Changes extends View {
         }
         if (key() !== context) return;
         this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
-        this.watch(root, cx);
+        this.watch(scoped && prefix ? `${root}/${prefix}` : root, cx);
         if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.setLines([]); }
         // The first file's diff shows until you pick another.
         if (!this.open && !this.closed && files.length) this.open = files[0].path;
@@ -149,7 +174,7 @@ export default class Changes extends View {
   }
 
   commit(cx) {
-    if (!this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
+    if (location().scoped || !this.message.trim() || !this.root || this.busy || this.loading || this.context !== key()) return;
     const root = this.root, on = this.on, context = this.context, message = this.message.trim();
     this.busy = true; this.note = null;
     cx.spawn(async (cx) => {
@@ -175,7 +200,8 @@ export default class Changes extends View {
   render(cx) {
     if (key() !== this.context) this.refresh(cx);
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
-    const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
+    const scope = location(), live = paneLocation();
+    const enabled = Boolean(!scope.scoped && this.message.trim() && this.root && !this.busy && !this.loading);
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape" && this.typing) { this.typing = false; this.handle.focus(); cx.stop_propagation(); cx.notify(); }
@@ -184,6 +210,13 @@ export default class Changes extends View {
         .child(div().font_semibold().child("Changes"))
         .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(`${this.files.length} files`))
         .child(div().flex_1()).child(div().text_size(11).text_color(t.ansi2).child(`+${add}`)).child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)))
+      .child(v_flex().flex_none().px(12).py(8).gap(6).border_b(1).border_color(t.border)
+        .child(div().text_size(11).text_color(t.muted).truncate().child(scope.scoped ? `Directory: ${scope.on ? scope.on + ":" : ""}${scope.cwd}` : "Whole repository"))
+        .child(h_flex().gap(10).text_size(11)
+          .child(div().id("changes-use-directory").text_color(!this.busy && live.space && live.cwd ? t.accent : t.dim)
+            .cursor_pointer().on_click((_e, cx) => this.setScope(true, cx)).child("Use current pane directory"))
+          .when(scope.scoped, el => el.child(div().id("changes-whole-repository").text_color(this.busy ? t.dim : t.accent)
+            .cursor_pointer().on_click((_e, cx) => this.setScope(false, cx)).child("Whole repository")))))
       // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
       .child(div().flex_1().min_h(44).max_h(this.files.length * 28 + 12).relative().border_b(1).border_color(t.border)
         .child(v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6).children(this.files.map((f) => {
@@ -202,6 +235,7 @@ export default class Changes extends View {
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
         .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child("Select a file to view its changes"))))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
+      .when(scope.scoped, el => el.child(div().px(12).py(6).text_size(11).text_color(t.muted).child("Commit is unavailable in directory scope.")))
       .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
         .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
         .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy ? "Committing…" : "Commit")));

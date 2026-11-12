@@ -178,7 +178,13 @@ shared `"workspace.panels"`, set by the welcome); a status bar,
 `workspace-status`), and as examples `terminals` ("Terminals": tabs in
 the title bar, panes as cards, a space picker) and `win98`
 ("Herdr 98": a whole desktop in one mod, `win98`). Add a layout by
-writing a new file. The Files panel supports Windows folder paths with spaces,
+writing a new file. Changes shows the whole repository by default. Use
+"Use current pane directory" to pin status, change counts, and diffs to that
+folder and its descendants. This scope is saved per space in shared
+`"changes.scopes"` and stays fixed when changing directories or panes.
+"Whole repository" clears the pin. Commit is unavailable while a directory
+scope is active; whole-repository Commit stages all repository changes.
+The Files panel supports Windows folder paths with spaces,
 parentheses and apostrophes, and preserves Unicode file and folder names
 (including Chinese). Directory links expand as folders; their contents load
 only when expanded. Cmd-click (macOS) or Ctrl-click (other platforms) a
