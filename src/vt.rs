@@ -567,10 +567,11 @@ impl Row {
         let last = left.char_indices().last().unwrap().0;
         let start = word_range(left, last).start;
         let word = &left[start..];
-        let continuation = right.split_whitespace().next().unwrap();
+        // Sentence punctuation after the final segment is outside the path.
+        let continuation = right.split_whitespace().next().unwrap().trim_end_matches(',');
         if word.ends_with([')', ']', '}', ',', ';', '.']) { return false; }
         let path_char = |c: char| c.is_alphanumeric() || "/\\._-~$%:@+#=!?&*;()[]".contains(c);
-        if !continuation.chars().all(path_char) { return false; }
+        if continuation.is_empty() || !continuation.chars().all(path_char) { return false; }
         self.wraps || self.full(cols)
             || (word.ends_with(['/', '\\']) && next.text.len() - right.len() <= start)
     }
@@ -2520,6 +2521,49 @@ mod tests {
 
     fn found(text: &str, at: usize, _: bool) -> Option<std::ops::Range<usize>> {
         crate::links::find(text, at)
+    }
+
+    #[test]
+    fn remote_links_join_a_final_segment_followed_by_a_comma() {
+        let directory = "records/development/uds_xport_uho/";
+        let filename = "umts_uds_uho9_lifecycle_coverage_plan.md";
+        let prefix = "I recorded U9-32 coverage for Ian (";
+        let first = format!("{prefix}{directory}");
+        let expected = format!("{directory}{filename}");
+        let find = |text: &str, at: usize, joined: bool| crate::links::find_remote(text, at, joined);
+        // The program breaks early at a slash, before the terminal's right edge.
+        for ending in ["), covering:", "),", ") is ready.", ", covering:"] {
+            let mut vt = Vt::new(100, 4);
+            vt.write(format!("{first}\r\n  {filename}{ending}").as_bytes());
+            let start = prefix.chars().count() as u16;
+            let end = first.chars().count() as u16;
+            let filename_end = 2 + filename.len() as u16;
+            for (row, columns) in [(0, start..end), (1, 2..filename_end)] {
+                for col in columns {
+                    let hit = vt.remote_link_at(col, row, find)
+                        .unwrap_or_else(|| panic!("missing link at {col},{row}, ending {ending:?}"));
+                    assert_eq!(hit.target, expected, "at {col},{row}, ending {ending:?}");
+                    assert_eq!(hit.spans, vec![(0, start, end - 1), (1, 2, filename_end - 1)]);
+                }
+            }
+            assert!(vt.remote_link_at(filename_end, 1, find).is_none(), "punctuation is not part of the link");
+            assert!(vt.remote_link_at(start - 1, 0, find).is_none(), "opening wrapper is not part of the link");
+        }
+    }
+
+    #[test]
+    fn remote_path_continuations_reject_punctuation_only_and_internal_commas() {
+        let row = |text: &str| Row {
+            text: text.into(),
+            spots: text.char_indices().enumerate().map(|(x, (byte, _))| Spot {
+                y: 0, x: x as u16, width: 1, byte, uri: None,
+            }).collect(),
+            wraps: false,
+        };
+        let first = row("  records/development/uds_xport_uho/");
+        for text in ["  , covering:", "  segment,other.md", "    nested/file.md,"] {
+            assert!(!first.continues_path(&row(text), 100), "unexpected continuation: {text}");
+        }
     }
 
     #[test]
